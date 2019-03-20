@@ -4,7 +4,15 @@
 
 SoftwareSerial mySerial(5, 6); // RX, TX
 String dataPackage;
-float humidity = 10;
+
+// For test send data
+//int counter = 0;
+//String dataPackage = "";
+//float h = 38.888;
+//float t = 40;
+//float c = 11.2;
+//float dust = 300.03;
+
 void setup() {
   Serial.begin(9600);
   mySerial.begin(9600);
@@ -19,12 +27,13 @@ void setup() {
     while (1);
   }
  delay(1000);
- LoRa.setSpreadingFactor(7);
+ LoRa.setSpreadingFactor(8);
  LoRa.setSignalBandwidth(62.5E3);
  LoRa.crc();
 }
 
 void loop() {
+
   // try to parse packet
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
@@ -47,6 +56,26 @@ void loop() {
 //    mySerial.write(dataPackage[i]);   // Push each char 1 by 1 on each loop pass
 //  }
     delay(50);
-  }
+  } 
 
+/*
+//Send data
+  Serial.print("Sending packet: ");
+  Serial.println(counter);
+  dataPackage = String(h) + "\n" + String(t) + "\n" + String(c) + "\n" + String(dust) + "\n";
+  
+  // send packet
+  LoRa.beginPacket();
+  // LoRa.print("Start: ");
+  LoRa.print(dataPackage); // Here bro
+//LoRa.print("hello ");
+//LoRa.write(counter);
+  // LoRa.print(" end");
+//  LoRa.write(dataPackage);
+//  LoRa.write(counter);
+  LoRa.endPacket();
+
+  counter++;
+*/
+//  delay(5000);
 }
