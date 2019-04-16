@@ -1,44 +1,57 @@
 #include <Arduino_FreeRTOS.h>
 #include <queue.h>
-#include <semphr.h>  // add the FreeRTOS functions for Semaphores (or Flags).
-// #include <LiquidCrystal.h>
+#include <semphr.h>  
 #include <dht11.h>
 #include <SPI.h>
 #include <LoRa.h>
 #include <string.h>
-// LiquidCrystal lcd(22, 24, 26, 28, 30, 32); // Creates an LC object. Parameters: (rs, enable, d4, d5, d6, d7)
 
 dht11 DHT;
 #define DHT11_PIN 4
-
+#define alarmPin 13
+#define interruptPin 3
 #define USE_AVG
-#define sharpLEDPin  7   // Arduino digital pin 7 connect to sensor LED.
-#define sharpVoPin   A5   // Arduino analog pin 5 connect to sensor Vo.
+#define sharpLEDPin  7   //sensor LED.
+#define sharpVoPin   A5   //sensor Vo.
 #define N 100
 static unsigned long VoRawTotal = 0;
-static int VoRawCount = 0;  // Set the typical output voltage in Volts when there is zero dust.
-static float Voc = 0.6;     // Use the typical sensitivity in units of V per 100ug/m3.
+static int VoRawCount = 0; 
+static float Voc = 0.6;   
 const float K = 0.5;
 
 const TickType_t xTicksToWait = 100 / portTICK_PERIOD_MS;
 
-// Declare a mutex Semaphore Handle which we will use to manage the Serial Port.
-// It will be used to ensure only only one Task is accessing this resource at any time.
+
 SemaphoreHandle_t xSerialSemaphore;
+SemaphoreHandle_t xBinarySemaphore;
+
 QueueHandle_t xQueue;
-// define two Tasks for DigitalRead & AnalogRead
+QueueHandle_t xQueue2;
+
+
 void TaskDHT11( void *pvParameters );
 void TaskMQ9( void *pvParameters );
 void TaskDUST( void *pvParameters );
+void TaskLORA( void *pvParameters);
+void TaskAlarm(void *pvParameters);  
 // void TaskLCD( void *pvParameters );
 void TaskDEBUG( void *pvParameters );
-// the setup function runs once when you press reset or power the board
+
+static void vHandlerTask( void *pvParameters );
+static void vExampleInterruptHandler( void ); // ISR
+boolean state = false;
 void setup() {
   pinMode(sharpLEDPin, OUTPUT);
-  // initialize serial communication at 9600 bits per second:
+
   Serial.begin(9600);
   pinMode(9, OUTPUT);
   LoRa.setPins(53, 9, 2);
+  vSemaphoreCreateBinary( xBinarySemaphore );
+
+  pinMode(alarmPin, OUTPUT);
+  pinMode(interruptPin, INPUT);
+  attachInterrupt(digitalPinToInterrupt(interruptPin), vExampleInterruptHandler, CHANGE);  
+
   //SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));  Serial.println("LoRa Sender");
 
   // lcd.begin(20,4);
@@ -52,22 +65,15 @@ void setup() {
   // lcd.print("Dust density: doing");
 
   while (!Serial);
-  // Semaphores are useful to stop a Task proceeding, where it should be paused to wait,
-  // because it is sharing a resource, such as the Serial port.
-  // Semaphores should only be used whilst the scheduler is running, but we can set it up here.
-  if ( xSerialSemaphore == NULL )  // Check to confirm that the Serial Semaphore has not already been created.
+
+  if ( xSerialSemaphore == NULL ) 
   {
-    xSerialSemaphore = xSemaphoreCreateMutex();  // Create a mutex semaphore we will use to manage the Serial Port
-    if ( ( xSerialSemaphore ) != NULL )
-      xSemaphoreGive( ( xSerialSemaphore ) );  // Make the Serial Port available for use, by "Giving" the Semaphore.
+    xSerialSemaphore = xSemaphoreCreateMutex();  
+      xSemaphoreGive( ( xSerialSemaphore ) ); 
   }
 
   if (!LoRa.begin(433E6)) {
-    //     if ( xSemaphoreTake( xSerialSemaphore, ( TickType_t ) 5 ) == pdTRUE )
-    // {
     Serial.println("Starting LoRa failed!");
-    // xSemaphoreGive( xSerialSemaphore ); // Now free or "Give" the Serial Port for others.
-    // }
     while (1);
   }
   delay(1000);
@@ -76,39 +82,49 @@ void setup() {
   LoRa.setSignalBandwidth(62.5E3);
   LoRa.crc();
 
-  xQueue = xQueueCreate( 5, sizeof( float ) );
+  xQueue = xQueueCreate( 3, sizeof( float ) );
+  xQueue2 = xQueueCreate( 1, sizeof( float ) );
 
   if ( xQueue != NULL ) {
     xTaskCreate(
       TaskMQ9
       ,  (const portCHAR *) "ReadMQ9"
-      ,  200  // Stack size
+      ,  200  
       ,  NULL
-      ,  1  // Priority
+      ,  1  
       ,  NULL );
 
     xTaskCreate(
       TaskDHT11
-      ,  (const portCHAR *)"ReadDHT11"  // A name just for humans
-      ,  200  // This stack size can be checked & adjusted by reading the Stack Highwater
+      ,  (const portCHAR *)"ReadDHT11"  
+      ,  200  
       ,  NULL
-      ,  2  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
+      ,  2  
       ,  NULL );
     xTaskCreate(
       TaskDUST
       ,  (const portCHAR *) "ReadDustSensor"
-      ,  1000  // Stack size
+      ,  1000  
       ,  NULL
-      ,  3  // Priority
+      ,  3  
       ,  NULL );
 
     xTaskCreate(
       TaskLORA
       ,  (const portCHAR *) "Lora"
-      ,  200  // Stack size
+      ,  200  
       ,  NULL
-      ,  4  // Priority
+      ,  4  
       ,  NULL );
+//        xTaskCreate(
+      // TaskAlarm
+      // ,  (const portCHAR *) "Alarm"
+      // ,  200  
+      // ,  NULL
+      // ,  6  
+      // ,  NULL );
+
+    xTaskCreate(  vHandlerTask, "Handler", 200, NULL, 5, NULL );
     // xTaskCreate(
     //     TaskLCD
     //     ,  (const portCHAR *) "DisplayLCD"
@@ -125,8 +141,7 @@ void setup() {
     //   ,  3  // Priority
     //   ,  NULL );
 
-    // Now the Task scheduler, which takes over control of scheduling individual Tasks, is automatically started.
-  }
+    }
   else
   {
     /* The queue could not be created. */
@@ -135,58 +150,51 @@ void setup() {
 
 void loop()
 {
-  // Empty. Things are done in Tasks.
-
 }
 
-/*---------------------- Tasks ---------------------*/
-void TaskDHT11( void *pvParameters  )  // This is a Task.
+
+void TaskDHT11( void *pvParameters  )  
 {
   TickType_t xLastWakeTime;
   portBASE_TYPE xStatus;
   xLastWakeTime = xTaskGetTickCount();
-  for (;;) // A Task shall never return or exit.
+  for (;;) 
   {
-    int chk = DHT.read(DHT11_PIN);    // READ DATA
+    int chk = DHT.read(DHT11_PIN);   
 
     // lcd.setCursor(13,0);
     // lcd.print(DHT.temperature);
     // lcd.setCursor(13,1);
     // lcd.print(DHT.humidity);
-    // See if we can obtain or "Take" the Serial Semaphore.
-    // If the semaphore is not available, wait 5 ticks of the Scheduler to see if it becomes free.
     if ( xSemaphoreTake( xSerialSemaphore, ( TickType_t ) 5 ) == pdTRUE )
     {
-      // We were able to obtain or "Take" the semaphore and can now access the shared resource.
-      // We want to have the Serial Port for us alone, as it takes some time to print,
-      // so we don't want it getting stolen during the middle of a conversion.
-      // print out the state of the button:
-      Serial.print("DHT11, \tSTATUS: ");
+      // Serial.print("DHT11, \tSTATUS: ");
       switch (chk) {
         case DHTLIB_OK:
-          Serial.print("OK,\t");
+          Serial.println("DOING...\t");
           break;
         case DHTLIB_ERROR_CHECKSUM:
-          Serial.print("Checksum error,\t");
+          Serial.println("Checksum error,\t");
           break;
         case DHTLIB_ERROR_TIMEOUT:
-          Serial.print("Time out error,\t");
+          Serial.println("Time out error,\t");
           break;
         default:
-          Serial.print("Unknown error,\t");
+          Serial.println("Unknown error,\t");
           break;
       }
-      Serial.print("xLastWakeTime DHT: ");
-      Serial.println(xLastWakeTime);
-      Serial.print(DHT.humidity);
-      Serial.print(",\t");
+      // Serial.print("xLastWakeTime DHT: ");
+      // Serial.println(xLastWakeTime);
+      Serial.print("Humidity: ");
+      Serial.println(DHT.humidity);
+      Serial.print("Temperature: ");
       Serial.println(DHT.temperature);
       // Serial.println("FUCKING DHT_____");
       xStatus = xQueueSendToBack( xQueue, &DHT.humidity, 0 );
       xStatus = xQueueSendToBack( xQueue, &DHT.temperature, 0 );
       if ( xStatus != pdPASS ) Serial.println( "Could not send to the queue" );
 
-      xSemaphoreGive( xSerialSemaphore ); // Now free or "Give" the Serial Port for others.
+      xSemaphoreGive( xSerialSemaphore ); 
     }
 
     // vTaskDelay( 10000 / portTICK_PERIOD_MS );
@@ -194,7 +202,7 @@ void TaskDHT11( void *pvParameters  )  // This is a Task.
   }
 }
 
-void TaskMQ9( void *pvParameters  )  // This is a Task.
+void TaskMQ9( void *pvParameters  )  
 {
   TickType_t xLastWakeTime;
   portBASE_TYPE xStatus;
@@ -207,14 +215,11 @@ void TaskMQ9( void *pvParameters  )  // This is a Task.
     int sensorValue = analogRead(A0);
     sensor_volt = (float)sensorValue / 1024 * 5.0;
     RS_gas = (5.0 - sensor_volt) / sensor_volt; // omit *RL
-
-    // ratio = RS_gas/0.29;  // ratio = RS/R0 // Unline bro
-    ratio = 99;
+    ratio = RS_gas/0.29;  // ratio = RS/R0 // Unline bro
+    // ratio = 11.2;
     /*-----------------------------------------------------------------------*/
     // lcd.setCursor(13,2);
     // lcd.print(ratio);
-    // See if we can obtain or "Take" the Serial Semaphore.
-    // If the semaphore is not available, wait 5 ticks of the Scheduler to see if it becomes free.
     if ( xSemaphoreTake( xSerialSemaphore, ( TickType_t ) 5 ) == pdTRUE )
     {
       //    Serial.print("sensor_volt = ");
@@ -224,12 +229,14 @@ void TaskMQ9( void *pvParameters  )  // This is a Task.
       // Serial.print("xLastWakeTime CO: ");
       // Serial.println(xLastWakeTime);
       Serial.print("CO = ");
-      Serial.println(ratio);
+      Serial.print(ratio);
+      Serial.print("\t");      
+      Serial.println(sensor_volt);      
 
       xStatus = xQueueSendToBack( xQueue, &ratio, 0 );
-      // if( xStatus != pdPASS ) Serial.println( "Could not send to the queue" );
+      if( xStatus != pdPASS ) Serial.println( "Could not send to the queue" );
 
-      xSemaphoreGive( xSerialSemaphore ); // Now free or "Give" the Serial Port for others.
+      xSemaphoreGive( xSerialSemaphore );
     }
     // vTaskDelay( 9000 / portTICK_PERIOD_MS );
     vTaskDelayUntil( &xLastWakeTime, 625 );
@@ -237,7 +244,7 @@ void TaskMQ9( void *pvParameters  )  // This is a Task.
   }
 }
 
-void TaskDUST( void *pvParameters )  // This is a Task.
+void TaskDUST( void *pvParameters )  
 {
   TickType_t xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
@@ -245,78 +252,53 @@ void TaskDUST( void *pvParameters )  // This is a Task.
   for (;;) {
     // vTaskDelay( 2000 / portTICK_PERIOD_MS );
     digitalWrite(sharpLEDPin, LOW);
-    // Wait 0.28ms before taking a reading of the output voltage as per spec.
     vTaskDelay( 280 / portTICK_PERIOD_MS );
-    // Record the output voltage. This operation takes around 100 microseconds.
     int VoRaw = analogRead(sharpVoPin);
-    // Turn the dust sensor LED off by setting digital pin HIGH.
     digitalWrite(sharpLEDPin, HIGH);
-    // Wait for remainder of the 10ms cycle = 10000 - 280 - 100 microseconds.
     vTaskDelay( 9620 / portTICK_PERIOD_MS );
     float Vo = VoRaw;
-    // #ifdef USE_AVG
-    //   VoRawTotal += VoRaw;
-    //   VoRawCount++;
-    //   if ( VoRawCount >= N ) {
-    //     Vo = 1.0 * VoRawTotal / N;
-    //     VoRawCount = 0;
-    //     VoRawTotal = 0;
-    //   } else {
-    //   return;
-    //   }
-    //  #endif // USE_AVG
     Vo = Vo / 1024.0 * 5.0; // VOTLS :))
-    // float dV = Vo - Voc;
-    //   if ( dV < 0 ) {
-    //       dV = 0;
-    //       Voc = Vo;
-    //   }
-    // float dustDensity = dV / K * 100.0;
     float dustDensity = 0.17 * Vo - 0.1;
     if ( dustDensity < 0)
     {
       dustDensity = 0.00;
     }
 
-    // See if we can obtain or "Take" the Serial Semaphore.
-    // If the semaphore is not available, wait 5 ticks of the Scheduler to see if it becomes free.
     if ( xSemaphoreTake( xSerialSemaphore, ( TickType_t ) 5 ) == pdTRUE )
     {
       Serial.print("Dust density: ");
       Serial.print(dustDensity);
       Serial.println(" ug/m3");
 
-      xStatus = xQueueSendToBack( xQueue, &dustDensity, 0 );
+      xStatus = xQueueSendToBack( xQueue2, &dustDensity, 0 );
       // if( xStatus != pdPASS ) Serial.println( "Could not send to the queue" );
 
-      xSemaphoreGive( xSerialSemaphore ); // Now free or "Give" the Serial Port for others.
+      xSemaphoreGive( xSerialSemaphore );
     }
     // vTaskDelay( 3000 / portTICK_PERIOD_MS );
     // vTaskDelayUntil( &xLastWakeTime, ( 12000 / portTICK_PERIOD_MS ) );
   }
 }
 
-void TaskDEBUG( void *pvParameters )  // This is a Task.
+void TaskDEBUG( void *pvParameters )  
 {
   TickType_t xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
-  for (;;) // A Task shall never return or exit.
+  for (;;) 
   {
-    // See if we can obtain or "Take" the Serial Semaphore.
-    // If the semaphore is not available, wait 5 ticks of the Scheduler to see if it becomes free.
     if ( xSemaphoreTake( xSerialSemaphore, ( TickType_t ) 5 ) == pdTRUE )
     {
       Serial.println("DEBUG:)))");
       // Serial.print("Dust density: ");
       // Serial.println(" ug/m3");
-      xSemaphoreGive( xSerialSemaphore ); // Now free or "Give" the Serial Port for others.
+      xSemaphoreGive( xSerialSemaphore ); 
     }
     // vTaskDelay( 2000 / portTICK_PERIOD_MS );
     vTaskDelayUntil( &xLastWakeTime, ( 10000 / portTICK_PERIOD_MS ) );
   }
 }
 
-void TaskLORA( void *pvParameters)  // This is a Task.
+void TaskLORA( void *pvParameters)  
 {
   String dataPackage = "";
   float h, t, c, dust;
@@ -326,8 +308,6 @@ void TaskLORA( void *pvParameters)  // This is a Task.
   // unsigned portBASE_TYPE check;
   for (;;) // A Task shall never return or exit.
   {
-    // See if we can obtain or "Take" the Serial Semaphore.
-    // If the semaphore is not available, wait 5 ticks of the Scheduler to see if it becomes free.
     if ( xSemaphoreTake( xSerialSemaphore, ( TickType_t ) 5 ) == pdTRUE )
     {
       // xStatus = xQueueReceive( xQueue, &h, 0 );
@@ -336,7 +316,7 @@ void TaskLORA( void *pvParameters)  // This is a Task.
       //  }
       // check = uxQueueMEssagesWaiting (xQueue);
 
-      // switch (uxQueueMessagesWaiting( xQueue )) {
+      // switch (uxQueueMessagesWaiting( xQueue )) { // For Debug
       //   case 1:
       //     Serial.println("HERE 1");
       //     break;
@@ -352,30 +332,44 @@ void TaskLORA( void *pvParameters)  // This is a Task.
       //   default: Serial.println("FULL");
       //     break;
       // }
-      if ( uxQueueMessagesWaiting (xQueue) == 4 ) {
+      if ( uxQueueMessagesWaiting (xQueue) == 3 && uxQueueMessagesWaiting (xQueue2) == 1) {
         // Serial.println("DEBUG:))");
         xStatus = xQueueReceive( xQueue, &h, 0 );
+        LoRa.beginPacket();
+        LoRa.print('1');
+        LoRa.print('\n');
+        LoRa.print(h);
+        LoRa.print('\n');
         xStatus = xQueueReceive( xQueue, &t, 0 );
+        LoRa.print(t);
+        LoRa.print('\n');       
         xStatus = xQueueReceive( xQueue, &c, 0 );
-        xStatus = xQueueReceive( xQueue, &dust, 0 );
-        Serial.println("_______________________________");
+        LoRa.print(c);
+        LoRa.print('\n');       
+        xStatus = xQueueReceive( xQueue2, &dust, 0 );
+        LoRa.print(dust);
+        LoRa.print('\n');
+        LoRa.endPacket();        
+  
+        Serial.print("\nQueue received: ");
         Serial.print(h);
         Serial.print(t);
         Serial.print(c);
         Serial.println(dust);
+        Serial.println("_______________________________");        
         // sprintf(arrData, "%f\n%f\n%f\n%f\n", h, t, c, dust);
 //        dataPackage = String(h) + "\n" + String(t) + "\n" + String(c) + "\n" + String(dust) + "\n";
-//        Serial.println(dataPackage);
+       // Serial.println(dataPackage);
       
         // float x1 = 38;
         // float x2 = 40;
         // float x3 = 11.2;
         // float x4 = 300.03;
         // dataPackage = String(x1) + "\n" + String(x2) + "\n" + String(x3) + "\n" + String(x4) + "\n";
-        LoRa.beginPacket();
-        // LoRa.print("22\n33.3\n11.11\n300.03\n"); //For check Lora send
-        LoRa.write((float)h);
-        LoRa.endPacket();
+//         LoRa.beginPacket();
+//         LoRa.print("22\n33.3\n11.11\n300.03\n"); //For check Lora send
+// //        LoRa.write((float)h);
+//         LoRa.endPacket();
 
       }
 
@@ -394,12 +388,132 @@ void TaskLORA( void *pvParameters)  // This is a Task.
       // Serial.print(t);
       // Serial.print(c);
       // Serial.println(dust);
-      xSemaphoreGive( xSerialSemaphore ); // Now free or "Give" the Serial Port for others.
-
+      xSemaphoreGive( xSerialSemaphore ); 
     }
-    vTaskDelay( 5000 / portTICK_PERIOD_MS );
+    vTaskDelay( 1000 / portTICK_PERIOD_MS );
   }
 }
+
+static void vHandlerTask( void *pvParameters )
+{
+  /* Note that when you create a binary semaphore in FreeRTOS, it is ready
+  to be taken, so you may want to take the semaphore after you create it
+  so that the task waiting on this semaphore will block until given by
+  another task. */
+  xSemaphoreTake( xBinarySemaphore, 0);
+
+  /* As per most tasks, this task is implemented within an infinite loop. */
+  for( ;; )
+  {
+    /* Use the semaphore to wait for the event.  The semaphore was created
+    before the scheduler was started so before this task ran for the first
+    time.  The task blocks indefinitely meaning this function call will only
+    return once the semaphore has been successfully obtained - so there is no
+    need to check the returned value. */
+    xSemaphoreTake( xBinarySemaphore, portMAX_DELAY );
+
+    /* To get here the event must have occurred.  Process the event (in this
+    case we just print out a message). */  
+    // Serial.println( "Handler task - Processing event.\r\n" );
+      // digitalWrite(alarmPin, state);
+    if(state){
+        LoRa.beginPacket();
+        LoRa.print('0');
+        LoRa.endPacket(); 
+        state = false;
+    }
+  }
+}
+
+static void  vExampleInterruptHandler( void ){
+  portBASE_TYPE xHigherPriorityTaskWoken;
+  xHigherPriorityTaskWoken = pdFALSE;
+
+  /* 'Give' the semaphore to unblock the task. */
+  xSemaphoreGiveFromISR( xBinarySemaphore, (signed portBASE_TYPE*)&xHigherPriorityTaskWoken );
+
+  if( xHigherPriorityTaskWoken == pdTRUE )
+  {
+    /* Giving the semaphore unblocked a task, and the priority of the
+    unblocked task is higher than the currently running task - force
+    a context switch to ensure that the interrupt returns directly to
+    the unblocked (higher priority) task.
+
+    NOTE: The syntax for forcing a context switch is different depending
+    on the port being used.  Refer to the examples for the port you are
+    using for the correct method to use! */
+    // portSWITCH_CONTEXT();
+    // for (;;) {
+
+    //   }
+    // Serial.println("This is interrupt :)))");
+    state = true;
+    vPortYield();
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
