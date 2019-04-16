@@ -26,7 +26,7 @@ void setup() {
     while (1);
   }
   delay(1000);
- LoRa.setSpreadingFactor(7);
+ LoRa.setSpreadingFactor(8);
  LoRa.setSignalBandwidth(62.5E3);
  LoRa.crc();
 }
@@ -35,12 +35,13 @@ void loop() {
   Serial.print("Sending packet: ");
   Serial.println(counter);
   dataPackage = String(h) + "\n" + String(t) + "\n" + String(c) + "\n" + String(dust) + "\n";
+  Serial.println(dataPackage);
   // send packet
   LoRa.beginPacket();
   // LoRa.print("Start: ");
   LoRa.print(dataPackage);
   // LoRa.print(" end");
-//  LoRa.write(dataPakage);
+//  LoRa.write(dataPakage); // Error
 //  LoRa.write(counter);
   LoRa.endPacket();
 
